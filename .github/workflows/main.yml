@@ -1,12 +1,11 @@
 name: Security CI
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   sca-snyk:
@@ -18,41 +17,45 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js (for Snyk CLI installation)
+      - name: Setup Node.js (needed for Snyk CLI install)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'   # Snyk CLI installs via npm, node 20 is fine
+          node-version: '22'
 
-      - name: Install Snyk CLI
-        run: npm install -g snyk@latest
+      - name: Setup PHP / Composer
+        run: |
+          php -v || true
+          composer --version || (php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && php composer-setup.php --install-dir=/usr/local/bin --filename=composer)
 
-      - name: Setup PHP & Composer
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.1'    # adjust to the PHP version your app uses
-          extensions: mbstring, intl, mysqli, pdo_mysql
-          tools: composer:v2
-
-      - name: Install Composer dependencies (generate lockfile)
+      - name: Install PHP dependencies (generate composer.lock)
         run: |
           if [ -f composer.lock ]; then
-            composer install --no-interaction --prefer-dist --no-progress
+            composer install --no-interaction --prefer-dist
           else
-            composer update --no-interaction --prefer-dist --no-progress
+            composer install --no-interaction --prefer-dist || true
           fi
+
+      - name: Install Snyk CLI
+        run: |
+          npm install -g snyk
 
       - name: Authenticate Snyk
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          snyk auth $SNYK_TOKEN
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "SNYK_TOKEN is not set - skipping snyk auth"
+          else
+            snyk auth "$SNYK_TOKEN"
+          fi
 
-      - name: Run Snyk to check for vulnerabilities (PHP / Composer)
+      - name: Run Snyk to check for vulnerabilities (Composer)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          # test composer-based project; produce JSON + SARIF outputs
-          snyk test --file=composer.lock --json-file-output=snyk-report.json --sarif-file-output=snyk.sarif || true
+          snyk test --file=composer.lock --json-file-output=snyk-report.json --sarif-file-output=snyk.sarif --all-projects || true
+          snyk monitor --file=composer.lock || true
+        continue-on-error: true
 
       - name: Upload Snyk JSON report
         uses: actions/upload-artifact@v4
@@ -66,9 +69,10 @@ jobs:
           name: snyk-report-sarif
           path: snyk.sarif
 
+
   sast-codeql:
-    name: SAST - CodeQL
-    runs-on: ubuntu-latest
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
     permissions:
       security-events: write
       packages: read
@@ -79,16 +83,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: php
-            build-mode: none
-          - language: javascript-typescript
-            build-mode: none
+        - language: actions
+          build-mode: none
+        - language: javascript-typescript
+          build-mode: none
+        - language: php
+          build-mode: none
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -96,10 +100,21 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
+      - if: matrix.build-mode == 'manual'
+        shell: bash
+        run: |
+          echo 'If you are using a "manual" build mode for one or more of the' \
+            'languages you are analyzing, replace this with the commands to build' \
+            'your code, for example:'
+          echo '  make bootstrap'
+          echo '  make release'
+          exit 1
+
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{matrix.language}}"
+
 
   secrets-gitleaks:
     name: Secret Scanning — Gitleaks (docker)
@@ -121,36 +136,59 @@ jobs:
           name: gitleaks-report.json
           path: gitleaks-report.json
 
+
   dast-zap:
-    name: DAST - OWASP ZAP
+    name: DAST - OWASP ZAP (uses ./start.sh)
     runs-on: ubuntu-latest
-    needs: [sca-snyk]   # optional: run after SCA
+    needs: sca-snyk
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Docker Compose
+      - name: Make start.sh executable
         run: |
-          docker-compose --version
+          chmod +x ./start.sh || true
+          ls -la start.sh
 
-      - name: Start services with docker-compose
+      - name: Build Docker image from repo
         run: |
-          # start the app & db defined in docker-compose.yml
-          docker-compose up -d --build
+          docker build -t vuln-app:latest .
 
-      - name: Wait for web service to become available
+      - name: Run container with start.sh
+        # run start.sh inside the image; forwarding port 8080 on host to container port 80
         run: |
-          # simple wait loop for http://localhost:8080
-          for i in {1..30}; do
-            if curl --silent --fail http://localhost:8080 >/dev/null; then
-              echo "Service available"
-              exit 0
-            fi
-            echo "Waiting for service... ($i/30)"
-            sleep 3
+          # ensure no previous container is using the name
+          docker rm -f vuln-app-ci || true
+          # run the container in detached mode, exposing container port 80 on host 8080
+          docker run --name vuln-app-ci -d -p 8080:80 vuln-app:latest /bin/bash -c "./start.sh"
+        env:
+          # expose any needed env vars here (if you want to override)
+          # e.g. MYSQL_PASSWORD: Sup3rS3cur3R00tP4SSW0RD!
+          # leave empty by default
+          DUMMY: "1"
+
+      - name: Wait for application to become available
+        run: |
+          timeout=120
+          echo "Waiting up to ${timeout}s for http://localhost:8080 to respond..."
+          SECONDS=0
+          until curl -fsS http://localhost:8080/ >/dev/null 2>&1 || [ $SECONDS -ge $timeout ]; do
+            sleep 2
           done
-          echo "Service did not become available" >&2
-          exit 1
+          if ! curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
+            echo "Application did not start in ${timeout}s"
+            docker logs vuln-app-ci --tail 200 || true
+            docker ps -a
+            exit 1
+          fi
+          echo "Application is up"
+
+      - name: Setup Node.js (for zap action dependencies)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Run ZAP Baseline (JSON output)
         uses: zaproxy/action-baseline@v0.14.0
@@ -166,6 +204,9 @@ jobs:
           name: dast_report_json
           path: dast_report.json
 
-      - name: Tear down docker-compose services
+      - name: Tear down container
         if: always()
-        run: docker-compose down --volumes --remove-orphans
+        run: |
+          docker logs vuln-app-ci --tail 200 || true
+          docker rm -f vuln-app-ci || true
+          docker image rm vuln-app:latest || true
