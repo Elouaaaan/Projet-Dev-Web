@@ -26,50 +26,81 @@ jobs:
       - name: Setup PHP / Composer
         run: |
           php -v || true
-          composer --version || (php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && php composer-setup.php --install-dir=/usr/local/bin --filename=composer)
-
-      - name: Install PHP dependencies (generate composer.lock)
-        run: |
-          if [ -f composer.lock ]; then
-            composer install --no-interaction --prefer-dist
-          else
-            composer install --no-interaction --prefer-dist || true
+          if ! command -v composer >/dev/null 2>&1; then
+            php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" \
+              && php composer-setup.php --install-dir=/usr/local/bin --filename=composer
           fi
+          composer --version
+
+      - name: Ensure Composer lockfile (create if missing)
+        run: |
+          # if composer.lock exists keep it; otherwise try to create a lockfile
+          if [ -f composer.lock ]; then
+            echo "composer.lock already present"
+          else
+            echo "No composer.lock found — attempting to generate one (composer update --no-interaction)"
+            # composer update will produce composer.lock; allow failures but continue
+            composer update --no-interaction || true
+          fi
+          echo "Lockfile present?"; ls -la composer.lock || true
+          echo "composer.json exists?"; ls -la composer.json || true
 
       - name: Install Snyk CLI
         run: |
           npm install -g snyk
+          snyk --version
 
-      - name: Authenticate Snyk
+      - name: Determine Snyk target and run scan (produce JSON + SARIF)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          if [ -z "$SNYK_TOKEN" ]; then
-            echo "SNYK_TOKEN is not set - skipping snyk auth"
+          # pick best target: composer.lock if available, otherwise composer.json
+          if [ -f composer.lock ]; then
+            TARGET="--file=composer.lock"
+            echo "Using composer.lock as Snyk target"
+          elif [ -f composer.json ]; then
+            TARGET="--file=composer.json"
+            echo "composer.lock not found; using composer.json as Snyk target"
           else
-            snyk auth "$SNYK_TOKEN"
+            echo "No composer.json or composer.lock found — running generic snyk test"
+            TARGET=""
           fi
 
-      - name: Run Snyk to check for vulnerabilities (Composer)
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          # Authenticate only if token provided (optional, but good for monitor)
+          if [ -n "$SNYK_TOKEN" ]; then
+            snyk auth "$SNYK_TOKEN" || true
+          fi
+
+          # Run snyk and force outputs to files. Use || true so job continues and files get created if possible.
+          snyk test $TARGET --json-file-output=snyk-report.json --sarif-file-output=snyk.sarif --all-projects || true
+
+          # Also run monitor (optional) so Snyk creates a snapshot in your org (doesn't affect artifact files)
+          if [ -n "$SNYK_TOKEN" ]; then
+            snyk monitor $TARGET || true
+          fi
+
+      - name: Show produced files (for debugging)
         run: |
-          snyk test --file=composer.lock --json-file-output=snyk-report.json --sarif-file-output=snyk.sarif --all-projects || true
-          snyk monitor --file=composer.lock || true
-        continue-on-error: true
+          echo "Workspace top-level:"
+          ls -la
+          echo "Look for Snyk outputs:"
+          [ -f snyk-report.json ] && echo "snyk-report.json exists (size: $(stat -c%s snyk-report.json))" || echo "snyk-report.json NOT found"
+          [ -f snyk.sarif ] && echo "snyk.sarif exists (size: $(stat -c%s snyk.sarif))" || echo "snyk.sarif NOT found"
+          echo "If files missing, check previous logs above for errors."
 
       - name: Upload Snyk JSON report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: snyk-report-json
           path: snyk-report.json
 
       - name: Upload Snyk SARIF report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: snyk-report-sarif
           path: snyk.sarif
-
 
   sast-codeql:
     name: Analyze (${{ matrix.language }})
