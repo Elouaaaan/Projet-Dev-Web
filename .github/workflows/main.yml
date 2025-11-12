@@ -1,0 +1,171 @@
+name: Security CI
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  sca-snyk:
+    name: SCA - Snyk (PHP / Composer)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js (for Snyk CLI installation)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'   # Snyk CLI installs via npm, node 20 is fine
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk@latest
+
+      - name: Setup PHP & Composer
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'    # adjust to the PHP version your app uses
+          extensions: mbstring, intl, mysqli, pdo_mysql
+          tools: composer:v2
+
+      - name: Install Composer dependencies (generate lockfile)
+        run: |
+          if [ -f composer.lock ]; then
+            composer install --no-interaction --prefer-dist --no-progress
+          else
+            composer update --no-interaction --prefer-dist --no-progress
+          fi
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk to check for vulnerabilities (PHP / Composer)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          # test composer-based project; produce JSON + SARIF outputs
+          snyk test --file=composer.lock --json-file-output=snyk-report.json --sarif-file-output=snyk.sarif || true
+
+      - name: Upload Snyk JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report-json
+          path: snyk-report.json
+
+      - name: Upload Snyk SARIF report
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report-sarif
+          path: snyk.sarif
+
+  sast-codeql:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: php
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+
+  secrets-gitleaks:
+    name: Secret Scanning — Gitleaks (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks (docker) and write report into workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo" zricethezav/gitleaks:latest \
+            detect --source /repo --report-format json --report-path /repo/gitleaks-report.json || true
+
+      - name: Upload Gitleaks report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report.json
+          path: gitleaks-report.json
+
+  dast-zap:
+    name: DAST - OWASP ZAP
+    runs-on: ubuntu-latest
+    needs: [sca-snyk]   # optional: run after SCA
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Compose
+        run: |
+          docker-compose --version
+
+      - name: Start services with docker-compose
+        run: |
+          # start the app & db defined in docker-compose.yml
+          docker-compose up -d --build
+
+      - name: Wait for web service to become available
+        run: |
+          # simple wait loop for http://localhost:8080
+          for i in {1..30}; do
+            if curl --silent --fail http://localhost:8080 >/dev/null; then
+              echo "Service available"
+              exit 0
+            fi
+            echo "Waiting for service... ($i/30)"
+            sleep 3
+          done
+          echo "Service did not become available" >&2
+          exit 1
+
+      - name: Run ZAP Baseline (JSON output)
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: "http://localhost:8080"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_action: false
+          cmd_options: "-J dast_report.json"
+
+      - name: Upload ZAP JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast_report_json
+          path: dast_report.json
+
+      - name: Tear down docker-compose services
+        if: always()
+        run: docker-compose down --volumes --remove-orphans
